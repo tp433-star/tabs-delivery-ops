@@ -1,0 +1,112 @@
+name: Implementation Health Monitor
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Every Monday at 9am
+  workflow_dispatch:       # Manual trigger for demos
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Fetch open implementation issues
+        id: fetch_issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'implementation',
+              per_page: 50
+            });
+            
+            const now = new Date();
+            const atRisk = [];
+            const onTrack = [];
+            const productGaps = [];
+            
+            for (const issue of issues.data) {
+              const daysSince = (now - new Date(issue.updated_at)) / (1000*60*60*24);
+              const labels = issue.labels.map(l => l.name);
+              const customer = issue.title.split(':')[0].trim();
+              
+              if (daysSince > 7) {
+                atRisk.push({ title: issue.title, url: issue.html_url, daysSince: Math.floor(daysSince), customer, number: issue.number });
+              } else {
+                onTrack.push({ title: issue.title, url: issue.html_url, customer });
+              }
+              
+              if (labels.includes('product-gap')) {
+                productGaps.push({ title: issue.title, url: issue.html_url, body: (issue.body || '').substring(0, 300) });
+              }
+            }
+            
+            const report = { atRisk, onTrack, productGaps, total: issues.data.length, reportDate: now.toISOString().split('T')[0] };
+            core.setOutput('report', JSON.stringify(report));
+            core.setOutput('at_risk_count', atRisk.length.toString());
+
+      - name: Generate AI status report
+        id: generate_report
+        run: |
+          REPORT='${{ steps.fetch_issues.outputs.report }}'
+          
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "x-api-key: ${{ secrets.ANTHROPIC_API_KEY }}" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "{
+              \"model\": \"claude-sonnet-4-20250514\",
+              \"max_tokens\": 1000,
+              \"messages\": [{
+                \"role\": \"user\",
+                \"content\": \"You are a Product Delivery Strategist at Tabs. Generate a crisp weekly implementation health report from this data: ${REPORT}. Format as plain text with sections: SUMMARY, AT-RISK PROJECTS (with action items), ON-TRACK PROJECTS, PRODUCT GAPS LOGGED. Keep each section to 3-5 lines max.\"
+              }]
+            }")
+          
+          REPORT_TEXT=$(echo $RESPONSE | python3 -c "import sys,json; data=json.load(sys.stdin); print(data['content'][0]['text'])")
+          echo "report_text<<EOF" >> $GITHUB_OUTPUT
+          echo "$REPORT_TEXT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create weekly digest issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const reportText = `${{ steps.generate_report.outputs.report_text }}`;
+            const reportData = JSON.parse('${{ steps.fetch_issues.outputs.report }}');
+            const atRiskCount = reportData.atRisk.length;
+            const label = atRiskCount > 0 ? '⚠️' : '✅';
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `${label} Weekly Implementation Health — ${reportData.reportDate}`,
+              body: `## AI-Generated Summary\n\n${reportText}\n\n---\n\n## Raw Data\n\`\`\`json\n${JSON.stringify(reportData, null, 2)}\n\`\`\``,
+              labels: ['weekly-digest', 'implementation-ops']
+            });
+
+      - name: Flag at-risk projects
+        if: steps.fetch_issues.outputs.at_risk_count > 0
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const reportData = JSON.parse('${{ steps.fetch_issues.outputs.report }}');
+            
+            for (const project of reportData.atRisk) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: project.number,
+                body: `🚨 **Auto-flag: No update in ${project.daysSince} days**\n\nThis implementation has gone dark. Action required:\n- [ ] Check in with customer stakeholder\n- [ ] Update milestone status\n- [ ] Escalate if blocked\n\n_Flagged by Implementation Health Monitor_`
+              });
+              
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: project.number,
+                labels: ['at-risk']
+              });
+            }
