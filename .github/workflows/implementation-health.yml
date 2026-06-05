@@ -43,34 +43,52 @@ jobs:
               }
 
               if (labels.includes('product-gap')) {
-                productGaps.push({ title: issue.title, url: issue.html_url, body: (issue.body || '').substring(0, 300) });
+                productGaps.push({ title: issue.title, url: issue.html_url });
               }
             }
 
             const report = { atRisk, onTrack, productGaps, total: issues.data.length, reportDate: now.toISOString().split('T')[0] };
+            console.log('Report:', JSON.stringify(report));
             core.setOutput('report', JSON.stringify(report));
             core.setOutput('at_risk_count', String(atRisk.length));
+            core.setOutput('has_issues', String(issues.data.length > 0));
 
       - name: Generate AI status report
         id: generate_report
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          REPORT: ${{ steps.fetch_issues.outputs.report }}
         run: |
+          REPORT='${{ steps.fetch_issues.outputs.report }}'
+
           RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -H "content-type: application/json" \
             -d "{
               \"model\": \"claude-sonnet-4-20250514\",
-              \"max_tokens\": 1000,
+              \"max_tokens\": 800,
               \"messages\": [{
                 \"role\": \"user\",
-                \"content\": \"You are a Product Delivery Strategist at Tabs. Generate a crisp weekly implementation health report from this data: $REPORT. Format as plain text with sections: SUMMARY, AT-RISK PROJECTS (with action items), ON-TRACK PROJECTS, PRODUCT GAPS LOGGED. Keep each section to 3-5 lines max.\"
+                \"content\": \"You are a Product Delivery Strategist at Tabs. Generate a weekly implementation health report from this JSON data: ${REPORT}. Write plain text with 4 sections: SUMMARY (2 sentences), AT-RISK PROJECTS (list each with a specific action item), ON-TRACK PROJECTS (brief list), PRODUCT GAPS (list any gaps found). Be concrete and specific.\"
               }]
             }")
 
-          REPORT_TEXT=$(echo "$RESPONSE" | python3 -c "import sys,json; data=json.load(sys.stdin); print(data['content'][0]['text'])")
+          echo "Raw API response: $RESPONSE"
+
+          REPORT_TEXT=$(echo "$RESPONSE" | python3 -c "
+          import sys, json
+          try:
+              data = json.load(sys.stdin)
+              if 'content' in data:
+                  print(data['content'][0]['text'])
+              elif 'error' in data:
+                  print('API Error: ' + data['error']['message'])
+              else:
+                  print('Unexpected response: ' + str(data))
+          except Exception as e:
+              print('Parse error: ' + str(e))
+          ")
+
           echo "report_text<<EOF" >> $GITHUB_OUTPUT
           echo "$REPORT_TEXT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -82,18 +100,32 @@ jobs:
           REPORT_DATA: ${{ steps.fetch_issues.outputs.report }}
         with:
           script: |
-            const reportText = process.env.REPORT_TEXT;
+            const reportText = process.env.REPORT_TEXT || 'No report generated';
             const reportData = JSON.parse(process.env.REPORT_DATA);
             const atRiskCount = reportData.atRisk.length;
-            const label = atRiskCount > 0 ? '⚠️' : '✅';
+            const emoji = atRiskCount > 0 ? '⚠️' : '✅';
+
+            const body = [
+              '## AI-Generated Summary',
+              '',
+              reportText,
+              '',
+              '---',
+              `**Total projects:** ${reportData.total}`,
+              `**At-risk:** ${atRiskCount}`,
+              `**On-track:** ${reportData.onTrack.length}`,
+              `**Product gaps flagged:** ${reportData.productGaps.length}`,
+            ].join('\n');
 
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `${label} Weekly Implementation Health — ${reportData.reportDate}`,
-              body: `## AI-Generated Summary\n\n${reportText}\n\n---\n\n**At-risk:** ${atRiskCount} | **On-track:** ${reportData.onTrack.length} | **Product gaps:** ${reportData.productGaps.length}`,
+              title: `${emoji} Weekly Implementation Health — ${reportData.reportDate}`,
+              body,
               labels: ['weekly-digest']
             });
+
+            console.log('Digest issue created successfully');
 
       - name: Flag at-risk projects
         if: steps.fetch_issues.outputs.at_risk_count > 0
@@ -109,6 +141,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: project.number,
-                body: `🚨 **Auto-flag: No update in ${project.daysSince} days**\n\nAction required:\n- [ ] Check in with customer stakeholder\n- [ ] Update milestone status\n- [ ] Escalate if blocked\n\n_Flagged by Implementation Health Monitor_`
+                body: `🚨 **Auto-flag: No update in ${project.daysSince} days**\n\nAction required:\n- [ ] Check in with customer stakeholder\n- [ ] Update milestone status\n- [ ] Escalate if blocked\n\n_Flagged automatically by Implementation Health Monitor_`
               });
+              console.log(`Flagged issue #${project.number}: ${project.title}`);
             }
